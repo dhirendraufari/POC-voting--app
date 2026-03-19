@@ -1,0 +1,165 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  ACR_LOGIN_SERVER: nitorAcrPoc1.azurecr.io
+  IMAGE_NAME: react-app
+  IMAGE_TAG: $(Build.SourceVersion)
+  AKS_NAMESPACE_DEV: dev
+  AKS_NAMESPACE_PROD: prod
+
+stages:
+
+# 🔹 1. Build React App + Quality Check
+- stage: Build
+  displayName: "Build React App"
+  jobs:
+  - job: BuildReact
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - checkout: self
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+
+    - script: |
+        npm install
+        npm run build
+      displayName: "Build React App"
+
+    - script: |
+        npm run lint || true
+      displayName: "Lint Check"
+
+# 🔹 2. SonarQube Quality Gate
+- stage: Code_Quality
+  dependsOn: Build
+  jobs:
+  - job: Sonar
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'Sonar-Service'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'react-app'
+
+    - script: |
+        sonar-scanner
+      displayName: "Run Sonar Scan"
+
+    - task: SonarQubePublish@5
+      inputs:
+        pollingTimeoutSec: '300'
+
+# 🔹 3. Docker Build & Push
+- stage: Docker
+  dependsOn: Code_Quality
+  jobs:
+  - job: BuildPush
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - checkout: self
+
+    - task: Docker@2
+      displayName: "Build & Push Image"
+      inputs:
+        containerRegistry: 'ACR-ServiceConnection'
+        repository: '$(IMAGE_NAME)'
+        command: 'buildAndPush'
+        Dockerfile: 'Dockerfile'
+        tags: |
+          $(IMAGE_TAG)
+
+# 🔹 4. Security Scan (Trivy)
+- stage: Security
+  dependsOn: Docker
+  jobs:
+  - job: Trivy
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y wget
+        wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.50.1_Linux-64bit.deb
+        sudo dpkg -i trivy_0.50.1_Linux-64bit.deb
+      displayName: "Install Trivy"
+
+    - script: |
+        trivy image $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+      displayName: "Scan Image"
+
+# 🔹 5. Deploy to Dev (AKS)
+- stage: Deploy_Dev
+  dependsOn: Security
+  jobs:
+  - deployment: DevDeploy
+    environment: dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: KubernetesManifest@1
+            inputs:
+              action: deploy
+              kubernetesServiceConnection: 'AKS-ServiceConnection'
+              namespace: $(AKS_NAMESPACE_DEV)
+              manifests: |
+                k8s/deployment.yaml
+                k8s/service.yaml
+              containers: |
+                $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+
+          - script: |
+              kubectl rollout status deployment/react-app
+            displayName: "Rollout Check"
+
+# 🔹 6. Approval Gate
+- stage: Approval
+  dependsOn: Deploy_Dev
+  jobs:
+  - job: Wait
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        instructions: "Approve for Production"
+
+# 🔹 7. Deploy to Production
+- stage: Deploy_Prod
+  dependsOn: Approval
+  jobs:
+  - deployment: ProdDeploy
+    environment: prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: KubernetesManifest@1
+            inputs:
+              action: deploy
+              kubernetesServiceConnection: 'AKS-ServiceConnection'
+              namespace: $(AKS_NAMESPACE_PROD)
+              manifests: |
+                k8s/deployment.yaml
+                k8s/service.yaml
+              containers: |
+                $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+
+          - script: |
+              kubectl rollout status deployment/react-app
+            displayName: "Rollout Check"
